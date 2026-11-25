@@ -15,6 +15,7 @@ Windows tray recorder with local, timestamped transcription. It requires the OSC
 
 - 照常从 Steam 打开或退出 VRChat。工具在 Windows 托盘中显示状态。游戏内静音、Windows 锁屏或托盘暂停时，麦克风音频会停止写入。
 - 对方同意后，在托盘里点「已获同意 · 本次也录 VRChat 声音」。再次点击可停止第二轨。退出游戏、暂停或锁屏会清除这次选择。第二轨是当时 VRChat 播放的混音，可能同时包含多人、世界音效或游戏里的音乐。对方声音的轨道标为「VRChat」。
+- 鼠标悬停在托盘图标上，可以看到第二轨在等待声音、已收到声音，还是 Windows 音量合成器已将 VRChat 静音。看到静音提示时，检查 Windows「设置 → 系统 → 声音 → 音量合成器」里的 VRChat。文字稿也会标出第二轨已开启却没有收到声音的情况。
 - 退出游戏后，托盘会显示转写状态。转写成功的会话在输出目录的「文字稿」下生成一份 Markdown。程序只清理它自己创建并成功处理的音频。转写失败时，原音频留在「.vrchat-recorder」子目录，可从托盘重试。突然中断留下的未封装录音会保留，日志会显示会话编号，方便手动检查。重新进游戏时，待完成的转写会延后到下次退出。
 - 退出工具可使用托盘菜单。要停止登录启动，先在设置里取消勾选。应用日志和设置位于当前用户的「AppData\Local\VrchatSessionRecorder」。
 
@@ -37,6 +38,7 @@ Windows tray recorder with local, timestamped transcription. It requires the OSC
 
     dotnet run --project tests/OscSmoke -c Release -- --network
     dotnet run --project tests/CaptureSmoke -c Release
+    dotnet run --project tests/CaptureSmoke -c Release -- --game-loopback
     dotnet run --project tests/TranscriptionSmoke -c Release
 
 工具通过 Windows WASAPI 共享模式录音，通过 VRChat 的只读 OSC 状态控制麦克风写入。项目采用 MIT 许可。

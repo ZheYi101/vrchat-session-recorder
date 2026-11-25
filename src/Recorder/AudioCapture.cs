@@ -1,8 +1,10 @@
 using System.Buffers;
 using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using NAudio.CoreAudioApi;
+using NAudio.CoreAudioApi.Interfaces;
 using NAudio.Wave;
 
 namespace VrchatSessionRecorder;
@@ -22,6 +24,7 @@ internal sealed class AudioCapture : IAsyncDisposable
     private readonly long sessionStart;
     private readonly Func<bool> microphoneAllowed;
     private readonly Func<bool> gameAllowed;
+    private long lastGameSignal;
 
     public AudioCapture(
         string ffmpegPath, string workDirectory, long sessionStartTicks,
@@ -38,6 +41,15 @@ internal sealed class AudioCapture : IAsyncDisposable
 
     public event Action<string>? Faulted;
 
+    public bool HasRecentGameSignal
+    {
+        get
+        {
+            long timestamp = Volatile.Read(ref lastGameSignal);
+            return timestamp != 0 && Stopwatch.GetElapsedTime(timestamp) < TimeSpan.FromSeconds(3);
+        }
+    }
+
     public static IReadOnlyList<AudioDevice> ListMicrophones()
     {
         using var enumerator = new MMDeviceEnumerator();
@@ -51,11 +63,63 @@ internal sealed class AudioCapture : IAsyncDisposable
         return devices.OrderBy(device => device.DisplayName, StringComparer.CurrentCultureIgnoreCase).ToArray();
     }
 
+    public static string? GetGamePlaybackMuteNotice(int processId)
+    {
+        bool appMuted = false;
+        bool deviceMuted = false;
+        try
+        {
+            using var enumerator = new MMDeviceEnumerator();
+            foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+            {
+                using (device)
+                {
+                    var sessions = device.AudioSessionManager.Sessions;
+                    for (int index = 0; index < sessions.Count; index++)
+                    {
+                        using var session = sessions[index];
+                        if (session.GetProcessID != (uint)processId ||
+                            session.State != AudioSessionState.AudioSessionStateActive)
+                            continue;
+
+                        var volume = session.SimpleAudioVolume;
+                        if (volume.Mute || volume.Volume == 0)
+                        {
+                            appMuted = true;
+                            continue;
+                        }
+
+                        var endpointVolume = device.AudioEndpointVolume;
+                        if (!endpointVolume.Mute && endpointVolume.MasterVolumeLevelScalar > 0)
+                            return null;
+
+                        deviceMuted = true;
+                    }
+                }
+            }
+        }
+        catch (Exception error) when (error is COMException or InvalidOperationException)
+        {
+            // A device can disappear during enumeration, so leave the state unknown.
+            return null;
+        }
+
+        if (deviceMuted)
+            return "VRChat 的播放设备已静音";
+        return appMuted ? "Windows 音量合成器已将 VRChat 静音" : null;
+    }
+
     public Task SetMicrophoneAsync(string? deviceId) => microphone.ChangeAsync(deviceId,
         deviceId is null ? null : () => Task.FromResult(CreateMicrophone(deviceId)));
 
-    public Task SetGameAsync(int? processId) => game.ChangeAsync(processId?.ToString(CultureInfo.InvariantCulture),
-        processId is null ? null : () => CreateGameAsync(processId.Value));
+    public Task SetGameAsync(int? processId)
+    {
+        if (processId is null)
+            Volatile.Write(ref lastGameSignal, 0);
+
+        return game.ChangeAsync(processId?.ToString(CultureInfo.InvariantCulture),
+            processId is null ? null : () => CreateGameAsync(processId.Value));
+    }
 
     public Task FinishAsync() => Task.WhenAll(microphone.FinishAsync(), game.FinishAsync());
 
@@ -100,7 +164,8 @@ internal sealed class AudioCapture : IAsyncDisposable
 
         return new CaptureDevice(recorder, null, "game", ReportFailure,
             abort => new CaptureSlice(GameFormat, "game", "f32le", TimeSpan.Zero,
-                ffmpegPath, workDirectory, sessionStart, gameAllowed, ReportFailure, abort));
+                ffmpegPath, workDirectory, sessionStart, gameAllowed, ReportFailure, abort,
+                () => Volatile.Write(ref lastGameSignal, Stopwatch.GetTimestamp())));
     }
 
     private void ReportFailure(string message) => Faulted?.Invoke(message);
@@ -295,6 +360,7 @@ internal sealed class AudioCapture : IAsyncDisposable
         private readonly Func<bool> allowed;
         private readonly Action<string> reportFailure;
         private readonly Action abortSource;
+        private readonly Action? signalDetected;
         private readonly CancellationTokenSource encoderTimeout = new();
         private readonly Channel<Packet> packets = Channel.CreateBounded<Packet>(new BoundedChannelOptions(512)
         {
@@ -309,7 +375,7 @@ internal sealed class AudioCapture : IAsyncDisposable
 
         public CaptureSlice(WaveFormat format, string kind, string inputFormat, TimeSpan guard,
             string ffmpegPath, string workDirectory, long sessionStart,
-            Func<bool> allowed, Action<string> reportFailure, Action abortSource)
+            Func<bool> allowed, Action<string> reportFailure, Action abortSource, Action? signalDetected = null)
         {
             this.format = format;
             this.kind = kind;
@@ -321,6 +387,7 @@ internal sealed class AudioCapture : IAsyncDisposable
             this.allowed = allowed;
             this.reportFailure = reportFailure;
             this.abortSource = abortSource;
+            this.signalDetected = signalDetected;
             Completion = Task.Run(EncodeAsync);
         }
 
@@ -368,6 +435,10 @@ internal sealed class AudioCapture : IAsyncDisposable
             if (!CanCapture() || data.IsEmpty)
                 return;
 
+            // A Windows-muted renderer can supply all-zero packets with no Silent flag.
+            if (signalDetected is not null && ((flags & AudioClientBufferFlags.Silent) != 0 || !HasFloatSignal(data)))
+                return;
+
             if ((flags & AudioClientBufferFlags.TimestampError) != 0 || timestamp <= 0 ||
                 timestamp > ReferenceTimeNow() + TimeSpan.TicksPerMillisecond * 100)
             {
@@ -399,7 +470,11 @@ internal sealed class AudioCapture : IAsyncDisposable
             if (CanCapture())
             {
                 if (packets.Writer.TryWrite(packet))
+                {
+                    if (signalDetected is not null && HasFloatSignal(samples))
+                        signalDetected();
                     return;
+                }
 
                 Interlocked.Increment(ref droppedPackets);
             }
@@ -408,6 +483,16 @@ internal sealed class AudioCapture : IAsyncDisposable
         }
 
         private long FramesToTicks(long frames) => frames * TimeSpan.TicksPerSecond / format.SampleRate;
+
+        private static bool HasFloatSignal(ReadOnlySpan<byte> samples)
+        {
+            foreach (float sample in MemoryMarshal.Cast<byte, float>(samples))
+            {
+                if (Math.Abs(sample) > 0.0001f)
+                    return true;
+            }
+            return false;
+        }
 
         private async Task EncodeAsync()
         {
@@ -555,8 +640,9 @@ internal sealed class AudioCapture : IAsyncDisposable
                 "-hide_banner", "-loglevel", "error", "-nostdin", "-n", "-f", inputFormat,
                 "-ar", format.SampleRate.ToString(CultureInfo.InvariantCulture),
                 "-ac", format.Channels.ToString(CultureInfo.InvariantCulture), "-i", "pipe:0",
-                "-vn", "-ar", "48000", "-ac", "1", "-c:a", "libopus", "-application", "voip",
-                "-b:a", "32k", "-f", "ogg", path,
+                "-vn", "-ar", "48000", "-ac", format.Channels.ToString(CultureInfo.InvariantCulture),
+                "-c:a", "libopus", "-application", "voip", "-b:a", format.Channels == 1 ? "32k" : "48k",
+                "-flush_packets", "1", "-page_duration", "250000", "-f", "ogg", path,
             ];
             foreach (string arg in args)
                 startInfo.ArgumentList.Add(arg);

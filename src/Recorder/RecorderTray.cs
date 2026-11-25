@@ -21,6 +21,7 @@ internal sealed class RecorderTray : ApplicationContext
     private string? _sessionDirectory;
     private string? _requestedMicrophone;
     private int? _requestedGame;
+    private long _nextGameTrackCheck;
     private int _captureProcessId;
     private int _observedProcessId;
     private int _optedInProcessId;
@@ -32,6 +33,7 @@ internal sealed class RecorderTray : ApplicationContext
     private bool _processPending = true;
     private string? _captureError;
     private string? _lastNotice;
+    private string? _gamePlaybackMuteNotice;
     private CancellationTokenSource? _queueCancellation;
     private Task? _queueTask;
 
@@ -232,16 +234,33 @@ internal sealed class RecorderTray : ApplicationContext
         {
             return;
         }
+        Task micChange = Task.CompletedTask;
         if (mic != _requestedMicrophone)
         {
             _requestedMicrophone = mic;
-            await _capture.SetMicrophoneAsync(mic);
+            micChange = _capture.SetMicrophoneAsync(mic);
         }
-        if (game != _requestedGame)
+
+        Task gameChange = Task.CompletedTask;
+        Task<string?>? playbackCheck = null;
+        long now = Stopwatch.GetTimestamp();
+        if (game != _requestedGame || (game.HasValue && now >= _nextGameTrackCheck))
         {
+            if (game.HasValue && game != _requestedGame)
+                TranscriptionQueue.MarkGameRequested(_sessionDirectory!);
+
             _requestedGame = game;
-            await _capture.SetGameAsync(game);
+            _nextGameTrackCheck = now + 3 * Stopwatch.Frequency;
+            gameChange = _capture.SetGameAsync(game);
+            if (game is int gameProcessId)
+                playbackCheck = Task.Run(() => AudioCapture.GetGamePlaybackMuteNotice(gameProcessId));
+            else
+                _gamePlaybackMuteNotice = null;
         }
+
+        await Task.WhenAll(micChange, gameChange);
+        if (playbackCheck is not null)
+            _gamePlaybackMuteNotice = await playbackCheck;
     }
 
     private async Task CloseCaptureAsync()
@@ -252,6 +271,7 @@ internal sealed class RecorderTray : ApplicationContext
         _sessionDirectory = null;
         _requestedMicrophone = null;
         _requestedGame = null;
+        _gamePlaybackMuteNotice = null;
         if (capture is null || directory is null)
         {
             return;
@@ -426,11 +446,14 @@ internal sealed class RecorderTray : ApplicationContext
         _gameAudio.Text = includeGame ? "停止录本次 VRChat 声音" : "已获同意 · 本次也录 VRChat 声音";
         _pause.Text = _paused ? "恢复录音" : "暂停录音";
 
+        var gameStatus = _capture?.HasRecentGameSignal == true
+            ? "已收到 VRChat 声音"
+            : _gamePlaybackMuteNotice ?? "第二轨已开启，等待 VRChat 声音";
         _status.Text = !_settings.Configured ? "请先完成设置" :
             _paused || _locked ? "已暂停录音" :
             _captureError is not null ? _captureError :
             active ? (_mute.IsUnmuted ? "正在录自己的麦克风" : "麦克风关闭或等待 OSC") +
-                (includeGame ? " · 同时采集 VRChat 声音" : "") :
+                (includeGame ? " · " + gameStatus : "") :
             _queueTask is not null ? "正在检查或转写录音" :
             "等待 VRChat";
         _tray.Text = _status.Text.Length > 63 ? _status.Text[..63] : _status.Text;

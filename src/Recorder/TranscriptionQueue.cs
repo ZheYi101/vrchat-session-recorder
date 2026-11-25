@@ -18,6 +18,7 @@ internal sealed class TranscriptionQueue(
     private const string PendingName = "pending";
     private const string SessionMarkerName = "session.json";
     private const string ReadyName = "ready";
+    private const string GameRequestedName = "game-requested";
     private const string ScratchName = ".transcription";
     private const string InputName = "input.wav";
     private const string SubtitleName = "input.srt";
@@ -25,7 +26,15 @@ internal sealed class TranscriptionQueue(
     private const string CommitName = "commit.json";
     private const string CommitDraftName = "commit.pending.json";
     private const string ModelDirectoryName = "faster-whisper-large-v3-turbo";
+    private const string MicSpeaker = "我";
+    private const string GameSpeaker = "VRChat";
     private const double SilencePeakDb = -80;
+    private const double PhaseLossDb = 12;
+    private const string MonoLevels = "aformat=sample_fmts=s16:sample_rates=16000:channel_layouts=mono,volumedetect";
+    private const string GameLevels =
+        "[0:a:0]aformat=sample_fmts=s16:sample_rates=16000,asplit=2[channels][mixed];" +
+        "[channels]astats=metadata=0:reset=0:measure_perchannel=Peak_level:measure_overall=none[measured];" +
+        "[mixed]" + MonoLevels + "[mono]";
 
     private static readonly Regex SessionIdPattern = new(
         @"\A\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_[a-f0-9]{8}\z",
@@ -38,6 +47,9 @@ internal sealed class TranscriptionQueue(
         RegexOptions.CultureInvariant);
     private static readonly Regex PeakPattern = new(
         @"max_volume:\s+(?<peak>-?[\d.]+) dB", RegexOptions.CultureInvariant);
+    private static readonly Regex GameChannelPeakPattern = new(
+        @"Channel: (?<channel>[1-9]\d*)\r?\n[^\r\n]*Peak level dB: (?<peak>-?(?:[\d.]+|inf))",
+        RegexOptions.CultureInvariant);
     private static readonly Regex HashPattern = new(@"\A[A-F0-9]{64}\z", RegexOptions.CultureInvariant);
     private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
     private static readonly UTF8Encoding ProcessEncoding = new(encoderShouldEmitUTF8Identifier: false);
@@ -84,6 +96,23 @@ internal sealed class TranscriptionQueue(
 
         _ = ReadAudioSlices(session, allowScratch: false);
         WriteNewFile(ready, []);
+    }
+
+    public static void MarkGameRequested(string workDir)
+    {
+        string session = Path.GetFullPath(workDir);
+        RequireOwnedSession(session);
+        string requested = Path.Combine(session, GameRequestedName);
+        if (TryAttributes(requested) is not null)
+        {
+            RequirePlainFile(requested);
+            return;
+        }
+
+        if (TryAttributes(Path.Combine(session, ReadyName)) is not null)
+            throw new IOException("无法更改已结束会话的录音轨道。");
+
+        WriteNewFile(requested, []);
     }
 
     public static bool HasValidSessionMarker(string workDir)
@@ -176,7 +205,7 @@ internal sealed class TranscriptionQueue(
                     DeletePlainFileIfPresent(inputPath);
                     DeletePlainFileIfPresent(subtitlePath);
                     string hash = await HashFileAsync(slice.Path, cancellationToken);
-                    bool hasNonSilentAudio = await DecodeAsync(slice.Path, inputPath, scratch, cancellationToken);
+                    bool hasNonSilentAudio = await DecodeAsync(slice, inputPath, scratch, cancellationToken);
                     if (hasNonSilentAudio)
                     {
                         CheckLocalModel();
@@ -194,7 +223,8 @@ internal sealed class TranscriptionQueue(
             }
 
             cancellationToken.ThrowIfCancellationRequested();
-            byte[] markdown = Utf8.GetBytes(BuildMarkdown(sessionId, speech));
+            bool gameRequested = TryAttributes(Path.Combine(session, GameRequestedName)) is not null;
+            byte[] markdown = Utf8.GetBytes(BuildMarkdown(sessionId, audio, speech, gameRequested));
             var commit = new ArchiveCommit(Convert.ToHexString(SHA256.HashData(markdown)), sources.ToArray());
             WriteNewFile(draftPath, markdown);
             WriteNewFile(commitDraftPath, JsonSerializer.SerializeToUtf8Bytes(commit));
@@ -240,6 +270,7 @@ internal sealed class TranscriptionQueue(
         DeletePlainFileIfPresent(subtitlePath);
         DeletePlainFileIfPresent(draftPath);
         DeletePlainFileIfPresent(commitDraftPath);
+        DeletePlainFileIfPresent(Path.Combine(session, GameRequestedName));
         DeletePlainFileIfPresent(Path.Combine(session, ReadyName));
         DeletePlainFileIfPresent(commitPath);
         Directory.Delete(scratch);
@@ -248,30 +279,79 @@ internal sealed class TranscriptionQueue(
     }
 
     private async Task<bool> DecodeAsync(
-        string source, string destination, string workingDirectory, CancellationToken cancellationToken)
+        AudioSlice slice, string destination, string workingDirectory, CancellationToken cancellationToken)
     {
-        CommandResult result = await RunAsync(
-            ffmpegPath,
-            [
-                "-hide_banner", "-nostdin", "-loglevel", "info", "-xerror", "-protocol_whitelist", "file,pipe",
-                "-f", "ogg", "-i", source, "-map", "0:a:0",
-                "-af", "aformat=sample_fmts=s16:sample_rates=16000:channel_layouts=mono,volumedetect",
-                "-c:a", "pcm_s16le", "-rf64", "auto", "-n", destination
-            ],
-            workingDirectory,
-            cancellationToken);
-        if (result.ExitCode != 0)
-            throw new IOException($"无法读取录音（FFmpeg 退出码 {result.ExitCode}）。");
+        async Task<string> DecodeMonoAsync(string[] filterArguments)
+        {
+            CommandResult result = await RunAsync(
+                ffmpegPath,
+                [
+                    "-hide_banner", "-nostdin", "-loglevel", "info", "-xerror", "-protocol_whitelist", "file,pipe",
+                    "-f", "ogg", "-i", slice.Path, ..filterArguments,
+                    "-c:a", "pcm_s16le", "-rf64", "auto", "-n", destination
+                ],
+                workingDirectory,
+                cancellationToken);
+            if (result.ExitCode != 0)
+                throw new IOException($"无法读取录音（FFmpeg 退出码 {result.ExitCode}）。");
 
-        RequirePlainFile(destination);
-        Match peakMatch = PeakPattern.Match(result.Error);
+            RequirePlainFile(destination);
+            return result.Error;
+        }
+
+        bool measureChannels = slice.Speaker == GameSpeaker;
+        string levels = await DecodeMonoAsync(measureChannels
+            ? ["-filter_complex", GameLevels, "-map", "[measured]", "-f", "null", "-", "-map", "[mono]"]
+            : ["-map", "0:a:0", "-af", MonoLevels]);
+        double monoPeak = ReadMonoPeak(levels);
+        bool monoIsAudible = monoPeak > SilencePeakDb;
+        if (!measureChannels)
+            return monoIsAudible;
+
+        (int channel, double channelPeak) = ReadStrongestGameChannel(levels);
+        if (channelPeak <= SilencePeakDb || (monoIsAudible && channelPeak - monoPeak <= PhaseLossDb))
+            return monoIsAudible;
+
+        // Combining opposite channels can erase audible game speech. Keep the
+        // normal mix unless the measured mix dropped far below one source channel.
+        DeletePlainFileIfPresent(destination);
+        string pan = $"pan=mono|c0=c{channel - 1},{MonoLevels}";
+        levels = await DecodeMonoAsync(["-map", "0:a:0", "-af", pan]);
+        if (ReadMonoPeak(levels) <= SilencePeakDb)
+            throw new InvalidDataException("无法验证 VRChat 轨道的可听音频，已保留录音。");
+
+        return true;
+    }
+
+    private static double ReadMonoPeak(string levels)
+    {
+        Match peakMatch = PeakPattern.Match(levels);
         if (!peakMatch.Success ||
             !double.TryParse(peakMatch.Groups["peak"].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out double peak))
         {
             throw new InvalidDataException("无法验证解码后的音频。");
         }
 
-        return peak > SilencePeakDb;
+        return peak;
+    }
+
+    private static (int Channel, double Peak) ReadStrongestGameChannel(string levels)
+    {
+        var strongest = (Channel: 0, Peak: double.NegativeInfinity);
+        foreach (Match level in GameChannelPeakPattern.Matches(levels))
+        {
+            int channel = int.Parse(level.Groups["channel"].Value, CultureInfo.InvariantCulture);
+            string peakText = level.Groups["peak"].Value;
+            double peak = peakText == "-inf"
+                ? double.NegativeInfinity
+                : double.Parse(peakText, CultureInfo.InvariantCulture);
+            if (strongest.Channel == 0 || peak > strongest.Peak)
+                strongest = (channel, peak);
+        }
+        if (strongest.Channel == 0)
+            throw new InvalidDataException("无法验证 VRChat 音频的各声道。");
+
+        return strongest;
     }
 
     private async Task<IReadOnlyList<Cue>> TranscribeAsync(
@@ -421,7 +501,8 @@ internal sealed class TranscriptionQueue(
         return ((hours * 60L + minutes) * 60 + seconds) * 1000 + milliseconds;
     }
 
-    private static string BuildMarkdown(string sessionId, IEnumerable<Cue> cues)
+    private static string BuildMarkdown(
+        string sessionId, IReadOnlyList<AudioSlice> audio, IReadOnlyList<Cue> cues, bool gameRequested)
     {
         var text = new StringBuilder();
         foreach (Cue cue in cues.OrderBy(cue => cue.OffsetMs).ThenBy(cue => cue.Speaker, StringComparer.Ordinal))
@@ -432,6 +513,17 @@ internal sealed class TranscriptionQueue(
         }
 
         string heading = $"# VRChat 文字稿\n\n会话 {sessionId}\n\n";
+        var recordedTracks = audio.Select(slice => slice.Speaker).ToHashSet(StringComparer.Ordinal);
+        if (recordedTracks.Count > 0 || gameRequested)
+        {
+            var transcribedTracks = cues.Select(cue => cue.Speaker).ToHashSet(StringComparer.Ordinal);
+            var outcomes = new[] { MicSpeaker, GameSpeaker }.Where(recordedTracks.Contains).Select(speaker =>
+                transcribedTracks.Contains(speaker) ? $"{speaker}（已转写）" : $"{speaker}（音频近乎静音）").ToList();
+            if (gameRequested && !recordedTracks.Contains(GameSpeaker))
+                outcomes.Add($"{GameSpeaker}（已开启，未收到音频）");
+
+            heading += $"录音轨道：{string.Join(" · ", outcomes)}\n\n";
+        }
         if (text.Length == 0)
             return heading + "本次没有可转写的语音。\n";
 
@@ -455,7 +547,7 @@ internal sealed class TranscriptionQueue(
         foreach (string path in Directory.EnumerateFileSystemEntries(session).Order(StringComparer.Ordinal))
         {
             string name = Path.GetFileName(path);
-            if (name is SessionMarkerName or ReadyName)
+            if (name is SessionMarkerName or ReadyName or GameRequestedName)
             {
                 RequirePlainFile(path);
                 continue;
@@ -471,7 +563,7 @@ internal sealed class TranscriptionQueue(
                 throw new InvalidDataException("会话中有未完成或无法识别的录音文件。");
 
             RequirePlainFile(path);
-            string speaker = match.Groups["kind"].Value == "mic" ? "我" : "VRChat";
+            string speaker = match.Groups["kind"].Value == "mic" ? MicSpeaker : GameSpeaker;
             long offset = long.Parse(match.Groups["offset"].Value, CultureInfo.InvariantCulture);
             slices.Add(new AudioSlice(path, offset, speaker));
         }

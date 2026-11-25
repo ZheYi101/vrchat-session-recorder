@@ -15,11 +15,15 @@ if (args.Contains("--task", StringComparer.Ordinal))
         await Task.Delay(TimeSpan.FromMinutes(2));
     }
     string output = Path.Combine(Option(args, "--output_dir"), "input.srt");
-    await File.WriteAllTextAsync(output, "1\n00:00:00,120 --> 00:00:00,710\nSynthetic speech. テスト。\n\n");
+    string subtitles = Environment.GetEnvironmentVariable("VRCHAT_SMOKE_EMPTY_SUBTITLE") == "1"
+        ? string.Empty
+        : "1\n00:00:00,120 --> 00:00:00,710\nSynthetic speech. テスト。\n\n";
+    await File.WriteAllTextAsync(output, subtitles);
     return 0;
 }
 
-bool realRun = args is ["--real", _, _, _, _];
+bool realGameRun = args is ["--real-game", _, _, _, _];
+bool realRun = args is ["--real", _, _, _, _] || realGameRun;
 string ffmpeg = realRun ? args[1] : args.Length > 0 ? args[0] : "ffmpeg";
 string executable = Environment.ProcessPath!;
 string tempParent = Path.GetFullPath(Path.GetTempPath());
@@ -38,13 +42,16 @@ try
         const string realId = "2026-11-25_01-01-01_aabbccdd";
         string realRoot = CreateRoot("真实模型");
         string realSession = TranscriptionQueue.InitializeSession(realRoot, realId);
-        await GenerateOggAsync(Path.Combine(realSession, "mic-0-abc.ogg"), wav: args[4]);
+        string track = realGameRun ? "game" : "mic";
+        await GenerateOggAsync(Path.Combine(realSession, $"{track}-0-abc.ogg"), wav: args[4], oppositePhase: realGameRun);
         TranscriptionQueue.MarkClosed(realSession);
         var realQueue = new TranscriptionQueue(ffmpeg, args[2], args[3], realRoot);
         realQueue.StatusChanged += Console.WriteLine;
         await realQueue.ProcessPendingAsync(default);
         string realTranscript = await File.ReadAllTextAsync(Archive(realRoot, realId));
         Require(realTranscript.Contains("synthetic recording", StringComparison.OrdinalIgnoreCase), "Unexpected real transcript");
+        Require(!realGameRun || realTranscript.Contains("VRChat（已转写）", StringComparison.Ordinal),
+            "Real model did not transcribe the opposite-phase game track");
         Require(!Directory.Exists(realSession), "Real model did not archive the generated source");
         Console.WriteLine("Real local-model transcription and deletion passed.");
         return 0;
@@ -58,6 +65,8 @@ try
     TranscriptionQueue.MarkClosed(merged);
     await Queue(root).ProcessPendingAsync(default);
     string mergedText = await File.ReadAllTextAsync(Archive(root, mergedId));
+    Require(mergedText.Contains("录音轨道：我（已转写） · VRChat（已转写）", StringComparison.Ordinal),
+        "Missing two-track transcript outcomes");
     Require(mergedText.Contains("[00:00:02] VRChat：Synthetic speech. テスト。", StringComparison.Ordinal),
         "Missing aligned game speech");
     Require(mergedText.Contains("[00:00:05] 我：Synthetic speech. テスト。", StringComparison.Ordinal),
@@ -65,6 +74,75 @@ try
     Require(mergedText.IndexOf("VRChat：", StringComparison.Ordinal) < mergedText.IndexOf("我：", StringComparison.Ordinal),
         "Speech is out of order");
     Require(!Directory.Exists(merged), "Sources remain after a successful archive");
+
+    const string silentGameId = "2026-11-25_01-02-11_aabbccdd";
+    string silentGame = TranscriptionQueue.InitializeSession(root, silentGameId);
+    await GenerateOggAsync(Path.Combine(silentGame, "mic-000000005000-abcdef.ogg"));
+    await GenerateOggAsync(Path.Combine(silentGame, "game-000000002000-abcdef.ogg"), silent: true);
+    TranscriptionQueue.MarkClosed(silentGame);
+    await Queue(root).ProcessPendingAsync(default);
+    string silentGameText = await File.ReadAllTextAsync(Archive(root, silentGameId));
+    Require(silentGameText.Contains("录音轨道：我（已转写） · VRChat（音频近乎静音）", StringComparison.Ordinal),
+        "The archive does not explain why a recorded game track has no cues");
+    Require(!silentGameText.Contains("VRChat：", StringComparison.Ordinal) && !Directory.Exists(silentGame),
+        "Silent game audio generated a cue or was left in pending");
+
+    const string requestedGameId = "2026-11-25_01-02-13_aabbccdd";
+    string requestedGame = TranscriptionQueue.InitializeSession(root, requestedGameId);
+    TranscriptionQueue.MarkGameRequested(requestedGame);
+    TranscriptionQueue.MarkGameRequested(requestedGame);
+    await GenerateOggAsync(Path.Combine(requestedGame, "mic-0-abc.ogg"));
+    TranscriptionQueue.MarkClosed(requestedGame);
+    await Queue(root).ProcessPendingAsync(default);
+    string requestedGameText = await File.ReadAllTextAsync(Archive(root, requestedGameId));
+    Require(requestedGameText.Contains("录音轨道：我（已转写） · VRChat（已开启，未收到音频）", StringComparison.Ordinal) &&
+            !requestedGameText.Contains("VRChat：", StringComparison.Ordinal) && !Directory.Exists(requestedGame),
+        "An enabled game track with no packets was not reported or cleaned up");
+
+    string stereoRoot = CreateRoot("立体声");
+    const string oppositePhaseId = "2026-11-25_01-02-14_aabbccdd";
+    string oppositePhase = TranscriptionQueue.InitializeSession(stereoRoot, oppositePhaseId);
+    await GenerateOggAsync(
+        Path.Combine(oppositePhase, "game-0-abc.ogg"),
+        generator: "aevalsrc=0.15*sin(2*PI*410*t)|-0.15*sin(2*PI*410*t):s=48000");
+    TranscriptionQueue.MarkClosed(oppositePhase);
+    await Queue(stereoRoot).ProcessPendingAsync(default);
+    string oppositePhaseText = await File.ReadAllTextAsync(Archive(stereoRoot, oppositePhaseId));
+    Require(oppositePhaseText.Contains("录音轨道：VRChat（已转写）", StringComparison.Ordinal) &&
+            oppositePhaseText.Contains("[00:00:00] VRChat：Synthetic speech", StringComparison.Ordinal) &&
+            !Directory.Exists(oppositePhase),
+        "An audible game track was turned into silence by the stereo-to-mono mix");
+
+    const string directionalId = "2026-11-25_01-02-15_aabbccdd";
+    string directional = TranscriptionQueue.InitializeSession(stereoRoot, directionalId);
+    await GenerateOggAsync(
+        Path.Combine(directional, "game-0-abc.ogg"),
+        generator: "aevalsrc=0|0.15*sin(2*PI*410*t):s=48000");
+    TranscriptionQueue.MarkClosed(directional);
+    await Queue(stereoRoot).ProcessPendingAsync(default);
+    Require(File.ReadAllText(Archive(stereoRoot, directionalId)).Contains("录音轨道：VRChat（已转写）", StringComparison.Ordinal) &&
+            !Directory.Exists(directional),
+        "Ordinary directional stereo speech was not transcribed");
+
+    string emptySubtitleRoot = CreateRoot("有声轨道且字幕为空");
+    const string emptySubtitleId = "2026-11-25_01-02-12_aabbccdd";
+    string emptySubtitle = TranscriptionQueue.InitializeSession(emptySubtitleRoot, emptySubtitleId);
+    string emptyMic = Path.Combine(emptySubtitle, "mic-0-abc.ogg");
+    string emptyGame = Path.Combine(emptySubtitle, "game-0-abc.ogg");
+    await GenerateOggAsync(emptyMic, silent: true);
+    await GenerateOggAsync(emptyGame);
+    TranscriptionQueue.MarkClosed(emptySubtitle);
+    Environment.SetEnvironmentVariable("VRCHAT_SMOKE_EMPTY_SUBTITLE", "1");
+    try
+    {
+        await Queue(emptySubtitleRoot).ProcessPendingAsync(default);
+    }
+    finally
+    {
+        Environment.SetEnvironmentVariable("VRCHAT_SMOKE_EMPTY_SUBTITLE", null);
+    }
+    Require(File.Exists(emptyMic) && File.Exists(emptyGame) && !File.Exists(Archive(emptySubtitleRoot, emptySubtitleId)),
+        "Audio was discarded when a non-silent game track had no recognized cues");
 
     const string openedId = "2026-11-25_01-02-04_aabbccdd";
     string opened = TranscriptionQueue.InitializeSession(root, openedId);
@@ -74,8 +152,12 @@ try
     Require(File.Exists(openedAudio) && !File.Exists(Archive(root, openedId)), "An open session was processed");
     TranscriptionQueue.MarkClosed(opened);
     await Queue(root).ProcessPendingAsync(default);
-    Require(!File.Exists(openedAudio) && File.ReadAllText(Archive(root, openedId)).Contains("没有可转写", StringComparison.Ordinal),
+    string openedText = File.ReadAllText(Archive(root, openedId));
+    Require(!File.Exists(openedAudio) && openedText.Contains("没有可转写", StringComparison.Ordinal),
         "Silent closed session was not safely archived");
+    Require(openedText.Contains("录音轨道：我（音频近乎静音）", StringComparison.Ordinal) &&
+            !openedText.Contains("VRChat（", StringComparison.Ordinal),
+        "A legacy microphone-only job reports the optional game track as attempted");
 
     const string corruptId = "2026-11-25_01-02-05_aabbccdd";
     string corrupt = TranscriptionQueue.InitializeSession(root, corruptId);
@@ -208,7 +290,8 @@ static void Require(bool condition, string message)
         throw new InvalidOperationException(message);
 }
 
-async Task GenerateOggAsync(string path, bool silent = false, string? wav = null)
+async Task GenerateOggAsync(string path, bool silent = false, string? wav = null, string? generator = null,
+    bool oppositePhase = false)
 {
     var start = new ProcessStartInfo
     {
@@ -218,12 +301,13 @@ async Task GenerateOggAsync(string path, bool silent = false, string? wav = null
         RedirectStandardError = true
     };
     string[] input = wav is null
-        ? ["-f", "lavfi", "-i", silent ? "anullsrc=r=16000:cl=mono" : "sine=frequency=400:sample_rate=16000", "-t", "0.9"]
+        ? ["-f", "lavfi", "-i", generator ?? (silent ? "anullsrc=r=16000:cl=mono" : "sine=frequency=400:sample_rate=16000"), "-t", "0.9"]
         : ["-i", wav];
+    string[] layout = oppositePhase ? ["-af", "pan=stereo|c0=c0|c1=-1*c0"] : [];
     string[] arguments =
     [
         "-hide_banner", "-loglevel", "error", "-nostdin",
-        ..input, "-codec:a", "libopus", "-b:a", "32k", path
+        ..input, ..layout, "-codec:a", "libopus", "-b:a", generator is null && !oppositePhase ? "32k" : "64k", path
     ];
     foreach (string argument in arguments)
     {

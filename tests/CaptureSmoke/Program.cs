@@ -5,6 +5,26 @@ using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using VrchatSessionRecorder;
 
+if (args.FirstOrDefault() == "--game-loopback")
+{
+    await GameLoopbackSmoke.RunAsync(args.ElementAtOrDefault(1) ?? "ffmpeg",
+        args.ElementAtOrDefault(2) ?? "虚拟音频设备");
+    return;
+}
+if (args.FirstOrDefault() == "--render-loopback-smoke")
+{
+    await GameLoopbackSmoke.RenderAsync(args[1], args[2] == "target");
+    return;
+}
+if (args.FirstOrDefault() == "--probe-loopback")
+{
+    if (args.Length != 2 || !int.TryParse(args[1], out int processId) || processId <= 0)
+        throw new ArgumentException("Usage: --probe-loopback <process ID>");
+
+    await GameLoopbackSmoke.ProbeAsync(processId);
+    return;
+}
+
 const int sampleRate = 48000;
 const int toneMs = 40;
 string ffmpeg = args.Length == 0 ? "ffmpeg" : args[0];
@@ -19,6 +39,16 @@ try
     source.Close();
     await source.Completion.WaitAsync(TimeSpan.FromSeconds(20));
     Check(!Directory.EnumerateFiles(directory.FullName).Any(), "A muted source opened an output file.");
+
+    int gameSignals = 0;
+    var silentGame = new AudioCapture.CaptureSlice(WaveFormat.CreateIeeeFloatWaveFormat(48000, 2), "game", "f32le",
+        TimeSpan.Zero, ffmpeg, directory.FullName, sessionStart, () => true, faults.Enqueue,
+        () => faults.Enqueue("Game encoder stopped the source."), () => gameSignals++);
+    silentGame.OnData(new byte[4800 * 8], AudioClientBufferFlags.None, Now());
+    silentGame.Close();
+    await silentGame.Completion.WaitAsync(TimeSpan.FromSeconds(20));
+    Check(gameSignals == 0 && !Directory.EnumerateFiles(directory.FullName).Any(),
+        "All-zero game packets without the Silent flag must not open a file or show a signal.");
 
     Volatile.Write(ref allowed, 1);
     source = CreateSlice();
