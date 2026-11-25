@@ -1,0 +1,14 @@
+[Bb]in/
+[Oo]bj/
+.vs/
+artifacts/
+*.user
+*.zip
+*.wav
+*.ogg
+*.mka
+*.srt
+*.partial
+.vrchat-recorder/
+文字稿/
+settings.json
